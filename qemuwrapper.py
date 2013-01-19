@@ -45,6 +45,11 @@ import time
 import random
 import ctypes
 import hashlib
+from signal import signal, SIGTERM
+from sys import exit
+import atexit
+
+
 
 try:
     reload(sys)
@@ -81,13 +86,13 @@ msg = "WELCOME to qemuwrapper.py"
 debugmsg(2, msg)
 
 __author__ = 'Thomas Pani and Jeremy Grossmann'
-__version__ = '0.8.3.1'
+__version__ = '0.8.3'
 
 if platform.system() == 'Windows':
     QEMU_PATH = "qemu" # we still use Qemu 0.11.0 on Windows
 else:
-    QEMU_PATH = "qemu-system-i386"
-QEMU_IMG_PATH = "qemu-img"
+    QEMU_PATH = "/usr/local/bin/qemu-system-x86_64"
+QEMU_IMG_PATH = "/usr/local/bin/qemu-img"
 PORT = 10525
 IP = ""
 QEMU_INSTANCES = {}
@@ -106,6 +111,22 @@ if hasattr(sys, "frozen"):
 else:
     PEMU_DIR = os.path.dirname(os.path.abspath(__file__))
 
+def cleanup():
+    print "Shutdown in progress..."
+    for name in QEMU_INSTANCES.keys():
+        if QEMU_INSTANCES[name].process:
+            QEMU_INSTANCES[name].stop()
+        del QEMU_INSTANCES[name]
+    print "Shutdown completed."
+
+if __name__ == "__main__":
+    from time import sleep
+    atexit.register(cleanup)
+
+    # Normal exit when killed
+    signal(SIGTERM, lambda signum, stack_frame: exit(1))
+   
+    
 class UDPConnection:
     def __init__(self, saddr, sport, daddr, dport):
         self.saddr = saddr
@@ -221,6 +242,7 @@ class xEMUInstance(object):
             import signal
             try:
                 os.kill(self.process.pid, signal.SIGINT)
+                
             except OSError, e:
                 print >> sys.stderr, "Unable to stop Qemu instance", self.name
                 print >> sys.stderr, e
@@ -264,10 +286,12 @@ class xEMUInstance(object):
 
         for vlan in range(int(self.nics)):
             if qemuprotocol == 1:
+                myMac = str(hashlib.md5(self.name + str(vlan)).hexdigest())
+                macAddr = "00:00:ab:"+ myMac[6] + myMac[7] +":" + myMac[8] + myMac[9] +":" + myMac[10] + myMac[11]
                 if vlan in self.nic and vlan in self.udp:
-                    options.extend(['-device', '%s,mac=%s,netdev=gns3-%s' % (self.netcard, self.nic[vlan], vlan)])
+                    options.extend(['-device', '%s,mac=%s,netdev=gns3-%s' % (self.netcard, macAddr, vlan)])
                 else:
-                    options.extend(['-device', '%s,mac=00:00:ab:%02x:%02x:%02d' % (self.netcard, random.randint(0x00, 0xff), random.randint(0x00, 0xff), vlan)])
+                    options.extend(['-device', '%s,mac=%s' % (self.netcard, macAddr)])
                 if vlan in self.udp:
                     options.append('-netdev')
                     options.append('socket,id=gns3-%s,udp=%s:%s,localaddr=%s:%s' % (vlan, self.udp[vlan].daddr, self.udp[vlan].dport, self.udp[vlan].saddr, self.udp[vlan].sport))
@@ -293,7 +317,7 @@ class xEMUInstance(object):
 
     def _ser_options(self):
         if self.console:
-            return ['-serial', 'telnet:' + IP + ':%s,server,nowait' % self.console]
+            return ['-vnc',':%s' % self.console]
         else:
             return []
 
@@ -631,7 +655,6 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
             'cmd_list' : (1, 1),
             'qemu_path' : (1, 1),
             'qemu_img_path' : (1, 1),
-            #'qemu_base_mac' : (1, 1),
             'working_dir' : (1, 1),
             'reset' : (0, 0),
             'close' : (0, 0),
@@ -643,7 +666,7 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
             'delete' : (1, 1),
             'setattr' : (3, 3),
             'create_nic' : (3, 3),
-            'create_udp' : (6, 6),
+            'create_udp' : (5, 5),
             'delete_udp' : (2, 2),
             'create_capture' : (3, 3),
             'delete_capture' : (2, 2),
@@ -661,7 +684,7 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
         'junos': JunOSInstance,
         'ids': IDSInstance,
         }
-
+    
     # dynamips style status codes
     HSC_INFO_OK         = 100  #  ok
     HSC_INFO_MSG        = 101  #  informative message
@@ -683,44 +706,34 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
     close_connection = 0
 
     def send_reply(self, code, done, msg):
-        debugmsg(3, "QemuWrapperRequestHandler::send_reply(code=%s, done=%s, msg=%s)" % (str(code), str(done), str(msg)))
         sep = '-'
         if not done:
             sep = ' '
         self.wfile.write("%3d%s%s\r\n" % (code, sep, msg))
 
     def handle(self):
-        debugmsg(2, "QemuWrapperRequestHandler::handle()")
         print "Connection from", self.client_address
         try:
             self.handle_one_request()
             while not self.close_connection:
                 self.handle_one_request()
-        except socket.error, e:
-            print >> sys.stderr, e
-            self.request.close()
-            return
+        except socket.error:
+            cleanup()
 
     def __get_tokens(self, request):
-        debugmsg(3, "QemuWrapperRequestHandler::__get_tokens(%s)" % str(request))
         input_ = cStringIO.StringIO(request)
         tokens = []
         try:
-            tokens = csv.reader(input_, delimiter=' ', escapechar='\\').next()
+            tokens = csv.reader(input_, delimiter=' ').next()
         except StopIteration:
             pass
         return tokens
 
     def handle_one_request(self):
-        debugmsg(3, "QemuWrapperRequestHandler::handle_one_request()")
         request = self.rfile.readline()
         request = request.rstrip()      # Strip package delimiter.
 
-        # Don't process empty strings (this creates Broken Pipe exceptions)
-        #FIXME: this causes 100% cpu usage on Windows.
-        #if request == "":
-        #    return
-
+        
         # Parse request.
         tokens = self.__get_tokens(request)
         if len(tokens) < 2:
@@ -742,20 +755,14 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
             self.send_reply(self.HSC_ERR_UNK_CMD, 1,
                             "Unknown command '%s'" % command)
             return
-        try:
-            if len(data) < self.modules[module][command][0] or \
-                len(data) > self.modules[module][command][1]:
-                self.send_reply(self.HSC_ERR_BAD_PARAM, 1,
-                                "Bad number of parameters (%d with min/max=%d/%d)" %
-                                    (len(data),
-                                      self.modules[module][command][0],
-                                      self.modules[module][command][1])
-                                    )
-                return
-        except Exception, e:
-            # This can happen, if you add send command, but forget to define it in class modules
-            self.send_reply(self.HSC_ERR_INV_PARAM, 1, "Unknown Exception")
-            debugmsg(1, ("handle_one_request(), ERROR: Unknown Exception: ", e))
+        if len(data) < self.modules[module][command][0] or \
+           len(data) > self.modules[module][command][1]:
+            self.send_reply(self.HSC_ERR_BAD_PARAM, 1,
+                            "Bad number of parameters (%d with min/max=%d/%d)" %
+                                (len(data),
+                                 self.modules[module][command][0],
+                                 self.modules[module][command][1])
+                                )
             return
 
         # Call the function.
@@ -763,11 +770,9 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
         method(data)
 
     def do_qemuwrapper_version(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemuwrapper_version(%s)" % str(data))
         self.send_reply(self.HSC_INFO_OK, 1, __version__)
 
     def do_qemuwrapper_parser_test(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemuwrapper_parser_test(%s)" % str(data))
         for i in range(len(data)):
             self.send_reply(self.HSC_INFO_MSG, 0,
                             "arg %d (len %u): \"%s\"" % \
@@ -776,13 +781,11 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
         self.send_reply(self.HSC_INFO_OK, 1, "OK")
 
     def do_qemuwrapper_module_list(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemuwrapper_module_list(%s)" % str(data))
         for module in self.modules.keys():
             self.send_reply(self.HSC_INFO_MSG, 0, module)
         self.send_reply(self.HSC_INFO_OK, 1, "OK")
 
     def do_qemuwrapper_cmd_list(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemuwrapper_cmd_list(%s)" % str(data))
         module, = data
 
         if not module in self.modules.keys():
@@ -801,46 +804,37 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
         self.send_reply(self.HSC_INFO_OK, 1, "OK")
 
     def do_qemuwrapper_qemu_path(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemuwrapper_qemu_path(%s)" % str(data))
         qemu_path, = data
         try:
-            qemu_path = os.path.normpath(qemu_path)
             os.access(qemu_path, os.F_OK)
             global QEMU_PATH
             QEMU_PATH = qemu_path
             print "Qemu path is now %s" % QEMU_PATH
             for qemu_name in QEMU_INSTANCES.keys():
-                QEMU_INSTANCES[qemu_name].bin = os.path.join(os.getcwdu(), QEMU_INSTANCES[qemu_name].name)
+                QEMU_INSTANCES[qemu_name].bin = os.path.join(os.getcwd(), QEMU_INSTANCES[qemu_name].name)
             self.send_reply(self.HSC_INFO_OK, 1, "OK")
         except OSError, e:
             self.send_reply(self.HSC_ERR_INV_PARAM, 1,
                             "access: %s" % e.strerror)
 
     def do_qemuwrapper_qemu_img_path(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemuwrapper_qemu_img_path(%s)" % str(data))
         qemu_img_path, = data
         try:
-            qemu_img_path = os.path.normpath(qemu_img_path)
             os.access(qemu_img_path, os.F_OK)
             global QEMU_IMG_PATH
             QEMU_IMG_PATH = qemu_img_path
             print "Qemu-img path is now %s" % QEMU_IMG_PATH
             for qemu_name in QEMU_INSTANCES.keys():
-                QEMU_INSTANCES[qemu_name].img_bin = os.path.join(os.getcwdu(), QEMU_INSTANCES[qemu_name].name)
+                QEMU_INSTANCES[qemu_name].img_bin = os.path.join(os.getcwd(), QEMU_INSTANCES[qemu_name].name)
             self.send_reply(self.HSC_INFO_OK, 1, "OK")
         except OSError, e:
             self.send_reply(self.HSC_ERR_INV_PARAM, 1,
                             "access: %s" % e.strerror)
 
     def do_qemuwrapper_working_dir(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemuwrapper_working_dir(%s)" % str(data))
         working_dir, = data
         try:
-            working_dir = os.path.normpath(working_dir)
             os.chdir(working_dir)
-            global WORKDIR
-            WORKDIR = working_dir
-            print "Working directory is now %s" % WORKDIR
             for qemu_name in QEMU_INSTANCES.keys():
                 QEMU_INSTANCES[qemu_name].workdir = os.path.join(working_dir, QEMU_INSTANCES[qemu_name].name)
             self.send_reply(self.HSC_INFO_OK, 1, "OK")
@@ -849,27 +843,22 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
                             "chdir: %s" % e.strerror)
 
     def do_qemuwrapper_reset(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemuwrapper_reset(%s)" % str(data))
         cleanup()
         self.send_reply(self.HSC_INFO_OK, 1, "OK")
 
     def do_qemuwrapper_close(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemuwrapper_close(%s)" % str(data))
         self.send_reply(self.HSC_INFO_OK, 1, "OK")
         self.close_connection = 1
 
     def do_qemuwrapper_stop(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemuwrapper_stop(%s)" % str(data))
         self.send_reply(self.HSC_INFO_OK, 1, "OK")
         self.close_connection = 1
         self.server.stop()
 
     def do_qemu_version(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemu_version(%s)" % str(data))
         self.send_reply(self.HSC_INFO_OK, 1, __version__)
 
     def __qemu_create(self, dev_type, name):
-        debugmsg(2, "QemuWrapperRequestHandler::__qemu_create(dev_type=%s, name=%s)" % (str(dev_type), str(name)))
         try:
             devclass = self.qemu_classes[dev_type]
         except KeyError:
@@ -883,6 +872,7 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
 
         try:
             qemu_instance.create()
+            #qemu_instance.clean()
         except OSError, e:
             print >> sys.stderr, "Unable to create Qemu instance", name
             print >> sys.stderr, e
@@ -892,7 +882,7 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
         return 0
 
     def do_qemu_create(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemu_create(%s)" % str(data))
+        
         dev_type, name = data
         if self.__qemu_create(dev_type, name) == 0:
             self.send_reply(self.HSC_INFO_OK, 1, "Qemu '%s' created" % name)
@@ -901,7 +891,6 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
                             "unable to create Qemu instance '%s'" % name)
 
     def __qemu_delete(self, name):
-        debugmsg(2, "QemuWrapperRequestHandler::__qemu_delete(%s)" % str(name))
         if not name in QEMU_INSTANCES.keys():
             return 1
         if QEMU_INSTANCES[name].process and not QEMU_INSTANCES[name].stop():
@@ -910,7 +899,6 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
         return 0
 
     def do_qemu_delete(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemu_delete(%s)" % str(data))
         name, = data
         if self.__qemu_delete(name) == 0:
             self.send_reply(self.HSC_INFO_OK, 1, "Qemu '%s' deleted" % name)
@@ -919,7 +907,6 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
                             "unable to delete Qemu instance '%s'" % name)
 
     def do_qemu_setattr(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemu_setattr(%s)" % str(data))
         name, attr, value = data
         try:
             instance = QEMU_INSTANCES[name]
@@ -931,14 +918,11 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
             self.send_reply(self.HSC_ERR_UNK_OBJ, 1,
                             "Cannot set attribute '%s' for '%s" % (attr, name))
             return
-        if attr in ("image", "initrd", "kernel", "image1", "image2"):
-            value = os.path.normpath(value)
         print >> sys.stderr, '!! %s.%s = %s' % (name, attr, value)
         setattr(QEMU_INSTANCES[name], attr, value)
         self.send_reply(self.HSC_INFO_OK, 1, "%s set for '%s'" % (attr, name))
 
     def do_qemu_create_nic(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemu_create_nic(%s)" % str(data))
         name, vlan, mac = data
         if not name in QEMU_INSTANCES.keys():
             self.send_reply(self.HSC_ERR_UNK_OBJ, 1,
@@ -948,19 +932,17 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
         self.send_reply(self.HSC_INFO_OK, 1, "OK")
 
     def do_qemu_create_udp(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemu_create_udp(%s)" % str(data))
-        name, vlan, saddr, sport, daddr, dport = data
+        name, vlan, sport, daddr, dport = data
         if not name in QEMU_INSTANCES.keys():
             self.send_reply(self.HSC_ERR_UNK_OBJ, 1,
                             "unable to find Qemu '%s'" % name)
             return
-        udp_connection = UDPConnection(saddr, sport, daddr, dport)
+        udp_connection = UDPConnection(daddr,sport, daddr, dport)
         udp_connection.resolve_names()
         QEMU_INSTANCES[name].udp[int(vlan)] = udp_connection
         self.send_reply(self.HSC_INFO_OK, 1, "OK")
-
+        
     def do_qemu_delete_udp(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemu_delete_udp(%s)" % str(data))
         name, vlan = data
         if not name in QEMU_INSTANCES.keys():
             self.send_reply(self.HSC_ERR_UNK_OBJ, 1,
@@ -969,20 +951,18 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
         if QEMU_INSTANCES[name].udp.has_key(int(vlan)):
             del QEMU_INSTANCES[name].udp[int(vlan)]
         self.send_reply(self.HSC_INFO_OK, 1, "OK")
-
+        
     def do_qemu_create_capture(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemu_create_capture(%s)" % str(data))
         name, vlan, path = data
         if not name in QEMU_INSTANCES.keys():
             self.send_reply(self.HSC_ERR_UNK_OBJ, 1,
                             "unable to find Qemu '%s'" % name)
             return
 
-        QEMU_INSTANCES[name].capture[int(vlan)] = os.path.normpath(path)
+        QEMU_INSTANCES[name].capture[int(vlan)] = path
         self.send_reply(self.HSC_INFO_OK, 1, "OK")
-
+        
     def do_qemu_delete_capture(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemu_delete_capture(%s)" % str(data))
         name, vlan = data
         if not name in QEMU_INSTANCES.keys():
             self.send_reply(self.HSC_ERR_UNK_OBJ, 1,
@@ -993,7 +973,6 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
         self.send_reply(self.HSC_INFO_OK, 1, "OK")
 
     def do_qemu_start(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemu_start(%s)" % str(data))
         name, = data
         if not name in QEMU_INSTANCES.keys():
             self.send_reply(self.HSC_ERR_UNK_OBJ, 1,
@@ -1006,7 +985,6 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
             self.send_reply(self.HSC_INFO_OK, 1, "Qemu '%s' started" % name)
 
     def do_qemu_stop(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemu_stop(%s)" % str(data))
         name, = data
         if not QEMU_INSTANCES[name].process:
             self.send_reply(self.HSC_ERR_UNK_OBJ, 1,
@@ -1017,9 +995,8 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
                             "unable to stop instance '%s'" % name)
         else:
             self.send_reply(self.HSC_INFO_OK, 1, "Qemu '%s' stopped" % name)
-
+            
     def do_qemu_clean(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemu_clean(%s)" % str(data))
         name, = data
         if not name in QEMU_INSTANCES.keys():
             self.send_reply(self.HSC_ERR_UNK_OBJ, 1,
@@ -1027,9 +1004,8 @@ class QemuWrapperRequestHandler(SocketServer.StreamRequestHandler):
             return
         QEMU_INSTANCES[name].clean()
         self.send_reply(self.HSC_INFO_OK, 1, "OK")
-
+        
     def do_qemu_unbase(self, data):
-        debugmsg(2, "QemuWrapperRequestHandler::do_qemu_unbase(%s)" % str(data))
         name, = data
         if not name in QEMU_INSTANCES.keys():
             self.send_reply(self.HSC_ERR_UNK_OBJ, 1,
@@ -1068,13 +1044,7 @@ class QemuWrapperServer(DaemonThreadingMixIn, SocketServer.TCPServer):
         self.stopping.set()
 
 
-def cleanup():
-    print "Shutdown in progress..."
-    for name in QEMU_INSTANCES.keys():
-        if QEMU_INSTANCES[name].process:
-            QEMU_INSTANCES[name].stop()
-        del QEMU_INSTANCES[name]
-    print "Shutdown completed."
+
 
 
 def main():
@@ -1171,3 +1141,4 @@ if __name__ == '__main__':
             sys.exit(1)
 
     main()
+    
